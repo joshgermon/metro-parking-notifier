@@ -1,15 +1,26 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+
+import { Effect } from 'effect';
+import { verifyDiscordSignature } from './discord';
+
+const handleRequest = (request: Request, env: Env) =>
+	Effect.gen(function*() {
+		const body = yield* Effect.promise(() => request.text());
+
+		const signature = request.headers.get('x-signature-ed25519');
+		const timestamp = request.headers.get('x-signature-timestamp');
+
+		const discordPublicKey = env.DISCORD_PUBLIC_KEY
+
+		if (!signature || !timestamp) {
+			return new Response(null, { status: 403 });
+		}
+
+		const ok = yield* verifyDiscordSignature(body, signature, timestamp, discordPublicKey);
+
+		if (!ok) return new Response(null, { status: 403 });
+
+	});
+
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
