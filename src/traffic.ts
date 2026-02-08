@@ -15,9 +15,9 @@ const GoogleMapsResponse = Schema.Struct({
 	status: Schema.String,
 });
 
-export const checkTraffic = (from: string, station: string, apiKey: string) =>
+// dest can be a string address or coordinates "lat,lng"
+export const checkTraffic = (from: string, dest: string, apiKey: string) =>
 	Effect.gen(function* () {
-		const dest = `${station} Station, NSW`;
 		const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(from)}&destinations=${encodeURIComponent(dest)}&departure_time=now&key=${apiKey}`;
 
 		const response = yield* Effect.tryPromise({

@@ -3,6 +3,9 @@
 	"version": "0.0.0",
 	"private": true,
 	"scripts": {
+		"sync-stations": "tsx --env-file=.dev.vars scripts/sync-stations.ts",
+		"register-commands": "tsx --env-file=.dev.vars scripts/register-commands.ts",
+		"predeploy": "npm run sync-stations && npm run register-commands",
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
@@ -13,6 +16,7 @@
 		"@cloudflare/vitest-pool-workers": "^0.12.4",
 		"@effect/language-service": "^0.73.0",
 		"@types/node": "^25.2.1",
+		"tsx": "^4.21.0",
 		"typescript": "^5.5.2",
 		"vitest": "~3.2.0",
 		"wrangler": "^4.63.0"
