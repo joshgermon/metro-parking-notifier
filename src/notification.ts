@@ -70,13 +70,19 @@ const sendDM = (channelId: string, content: string, botToken: string) =>
 		}
 	});
 
-const formatNotification = (result: LeaveByResult, prefs: UserPrefs, previousLeaveByMinutes: number | null) => {
+const formatNotification = (result: LeaveByResult, prefs: UserPrefs, trigger: string) => {
 	const urgency = result.predictedFill >= 90 ? '🚨' : result.predictedFill >= 75 ? '⚠️' : '🅿️';
 	const [arrH, arrM] = prefs.arrival.split(':').map(Number);
 	const arrivalDecimal = arrH + (arrM ?? 0) / 60;
 	const lotWontFill = result.estimatedFullTime === null || result.estimatedFullTime >= arrivalDecimal;
 
 	let message = `${urgency} **${result.stationName} Station Parking**\n\n`;
+
+	if (trigger === 'deviation_alert') {
+		// This is a re-notification due to unusual conditions
+		message += `⚠️ **Busier than usual today**\n`;
+		message += `Currently ${Math.round(result.deviation)}pp above typical for this time\n\n`;
+	}
 
 	if (lotWontFill && result.predictedFill < 75) {
 		message += `You can leave at your usual time (**${result.leaveByFormatted}**)\n\n`;
@@ -135,14 +141,11 @@ const formatNotification = (result: LeaveByResult, prefs: UserPrefs, previousLea
 		message += `\n${fillRateText}`;
 	}
 
-	if (previousLeaveByMinutes !== null) {
-		const currentLeaveByMinutes = result.leaveByTime.getHours() * 60 + result.leaveByTime.getMinutes();
-		const delta = previousLeaveByMinutes - currentLeaveByMinutes;
-		if (delta > 0) {
-			message += `\n\n⚠️ **Leave ${delta} mins earlier than last update**`;
-		} else if (delta < -5) {
-			message += `\n\n✅ Conditions improved — ${Math.abs(delta)} mins more time than last update`;
-		}
+	// Show tracking status vs historical baseline
+	if (result.deviation > 5) {
+		message += `\n\n⚠️ Tracking ${Math.round(result.deviation)}pp above normal for this time`;
+	} else if (result.deviation < -5) {
+		message += `\n\n✅ Tracking ${Math.abs(Math.round(result.deviation))}pp below normal — quieter than usual`;
 	}
 
 	if (result.confidence === 'low') {
@@ -170,40 +173,51 @@ export const getUserPrefs = (userId: string, env: Env) =>
 		);
 	});
 
+interface LastNotificationData {
+	trigger: string;
+	deviation: number;
+	leaveByMinutes: number;
+	predictedFill: number;
+	timestamp: number;
+}
+
 const shouldSendNotification = (
 	userId: string,
-	current: { leaveByMinutes: number; predictedFill: number },
+	current: { leaveByMinutes: number; predictedFill: number; deviation: number },
 	env: Env,
 ) =>
 	Effect.gen(function* () {
 		const lastKey = `last_notification:${userId}`;
 		const last = yield* Effect.tryPromise(() => env.METRO_KV.get(lastKey, 'json'));
 
-		if (!last) return { shouldSend: true, previousLeaveByMinutes: null as number | null, trigger: 'first_notification' };
+		// First notification of the day — always send
+		if (!last) return { shouldSend: true, trigger: 'first_notification' };
 
-		const lastData = last as { leaveByMinutes: number; predictedFill: number; timestamp: number };
+		const lastData = last as LastNotificationData;
 
-		if (current.leaveByMinutes < lastData.leaveByMinutes - 2) {
-			return { shouldSend: true, previousLeaveByMinutes: lastData.leaveByMinutes, trigger: 'worsened' };
+		// Deviation alert: current fill is >=10pp above P90 baseline
+		// Only re-notify if:
+		//   1. Deviation is significant (>=10pp above P90)
+		//   2. At least 10 minutes since last notification (cooldown)
+		//   3. Either this is a new deviation event, or the situation has worsened further (>=5pp more deviation)
+		const timeSinceLast = Date.now() - lastData.timestamp;
+		const cooldownPassed = timeSinceLast >= 10 * 60 * 1000;
+
+		if (current.deviation >= 10 && cooldownPassed) {
+			const isNewDeviation = lastData.trigger === 'first_notification';
+			const hasWorsenedFurther = current.deviation >= lastData.deviation + 5;
+
+			if (isNewDeviation || hasWorsenedFurther) {
+				return { shouldSend: true, trigger: 'deviation_alert' };
+			}
 		}
 
-		if (Math.abs(lastData.leaveByMinutes - current.leaveByMinutes) >= 5) {
-			return { shouldSend: true, previousLeaveByMinutes: lastData.leaveByMinutes, trigger: 'leave_time_shifted' };
-		}
-		if (Math.abs(lastData.predictedFill - current.predictedFill) >= 5) {
-			return { shouldSend: true, previousLeaveByMinutes: lastData.leaveByMinutes, trigger: 'fill_changed' };
-		}
-
-		if (Date.now() - lastData.timestamp >= 15 * 60 * 1000) {
-			return { shouldSend: true, previousLeaveByMinutes: lastData.leaveByMinutes, trigger: 'periodic' };
-		}
-
-		return { shouldSend: false, previousLeaveByMinutes: lastData.leaveByMinutes, trigger: 'no_change' };
+		return { shouldSend: false, trigger: 'no_change' };
 	});
 
 const saveLastNotification = (
 	userId: string,
-	data: { leaveByMinutes: number; predictedFill: number },
+	data: { trigger: string; leaveByMinutes: number; predictedFill: number; deviation: number },
 	env: Env,
 ) =>
 	Effect.tryPromise(() =>
@@ -227,14 +241,17 @@ export interface UserNotificationResult {
 	trigger?: string;
 	dmChannelCached?: boolean;
 	errorType?: string;
+	deviation?: number;
 }
+
+const PEAK_END_HOUR = 9; // Stop notifications at 9am
 
 const processUserNotification = (userId: string, sydney: SydneyTime, env: Env): Effect.Effect<UserNotificationResult, never, never> =>
 	Effect.gen(function* () {
 		const log: UserNotificationResult = { userId, outcome: 'skipped', reason: '' };
 
 		const prefs = yield* getUserPrefs(userId, env);
-		
+
 		if (!prefs) {
 			log.reason = 'no_prefs';
 			return log;
@@ -248,9 +265,16 @@ const processUserNotification = (userId: string, sydney: SydneyTime, env: Env): 
 			return log;
 		}
 
+		const currentHour = sydney.hour + sydney.minute / 60;
+
+		// Stop notification processing after peak hours (9am)
+		if (currentHour >= PEAK_END_HOUR) {
+			log.reason = 'past_peak_hours';
+			return log;
+		}
+
 		const [startH, startM] = prefs.notificationStart.split(':').map(Number);
 		const notificationStart = startH + startM / 60;
-		const currentHour = sydney.hour + sydney.minute / 60;
 
 		if (currentHour < notificationStart) {
 			log.reason = 'too_early';
@@ -266,6 +290,7 @@ const processUserNotification = (userId: string, sydney: SydneyTime, env: Env): 
 		log.trafficDelay = result.trafficDelay;
 		log.zoneName = result.zoneName;
 		log.fillRate = result.fillRate ? `${result.fillRate.spotsPerMin}/min (${result.fillRate.description})` : null;
+		log.deviation = result.deviation;
 
 		if (sydney.date > result.leaveByTime) {
 			log.reason = 'deadline_passed';
@@ -273,9 +298,9 @@ const processUserNotification = (userId: string, sydney: SydneyTime, env: Env): 
 		}
 
 		const leaveByMinutes = result.leaveByTime.getHours() * 60 + result.leaveByTime.getMinutes();
-		const { shouldSend, previousLeaveByMinutes, trigger } = yield* shouldSendNotification(
+		const { shouldSend, trigger } = yield* shouldSendNotification(
 			userId,
-			{ leaveByMinutes, predictedFill: result.predictedFill },
+			{ leaveByMinutes, predictedFill: result.predictedFill, deviation: result.deviation },
 			env,
 		);
 
@@ -288,14 +313,14 @@ const processUserNotification = (userId: string, sydney: SydneyTime, env: Env): 
 
 		let channelId = yield* getCachedDMChannel(userId, env);
 		log.dmChannelCached = channelId !== null;
-		
+
 		if (!channelId) {
 			channelId = yield* createDMChannel(userId, env.DISCORD_BOT_TOKEN);
 			yield* cacheDMChannel(userId, channelId, env);
 		}
-		
-		const message = formatNotification(result, prefs, previousLeaveByMinutes);
-		
+
+		const message = formatNotification(result, prefs, trigger);
+
 		yield* sendDM(channelId, message, env.DISCORD_BOT_TOKEN).pipe(
 			Effect.catchAll((error) => {
 				if (String(error).includes('401') || String(error).includes('403')) {
@@ -309,9 +334,9 @@ const processUserNotification = (userId: string, sydney: SydneyTime, env: Env): 
 				return Effect.fail(error);
 			})
 		);
-		
-		yield* saveLastNotification(userId, { leaveByMinutes, predictedFill: result.predictedFill }, env);
-		
+
+		yield* saveLastNotification(userId, { trigger, leaveByMinutes, predictedFill: result.predictedFill, deviation: result.deviation }, env);
+
 		log.outcome = 'sent';
 		log.reason = trigger;
 		return log;

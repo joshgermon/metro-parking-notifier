@@ -14,12 +14,16 @@ const BASE_FILL_CURVE: Record<number, number> = {
 	9: 97,
 };
 
-const getBaselineForHour = (historical: HistoricalData | null, hour: number): number => {
+type BaselineMode = 'avg' | 'p90';
+
+const getBaselineForHour = (historical: HistoricalData | null, hour: number, mode: BaselineMode = 'p90'): number => {
 	const roundedHour = Math.floor(hour * 2) / 2;
 	const hourKey = String(roundedHour);
 
-	if (historical?.[hourKey]?.avg) {
-		return historical[hourKey].avg;
+	if (historical?.[hourKey]) {
+		const bucket = historical[hourKey];
+		if (mode === 'p90' && bucket.p90 > 0) return bucket.p90;
+		if (bucket.avg > 0) return bucket.avg;
 	}
 
 	return BASE_FILL_CURVE[roundedHour] ?? 50;
@@ -39,10 +43,15 @@ export const predictFillAtArrival = (input: PredictionInput, env: Env) =>
 
 		const historical = yield* getHistoricalData(station, dayOfWeek, env);
 
-		const baselineNow = getBaselineForHour(historical, currentHour);
-		const baselineAtArrival = getBaselineForHour(historical, arrivalHour);
+		// Use P90 as the conservative baseline
+		const baselineNow = getBaselineForHour(historical, currentHour, 'p90');
+		const baselineAtArrival = getBaselineForHour(historical, arrivalHour, 'p90');
 
-		const todayFactor = baselineNow > 0 ? currentFillPercent / baselineNow : 1;
+		// If today is tracking below P90, just use the P90 curve as-is (conservative)
+		// If today is tracking above P90, scale up proportionally
+		const todayFactor = currentFillPercent > baselineNow
+			? currentFillPercent / baselineNow
+			: 1;
 		const predictedFill = Math.min(100, baselineAtArrival * todayFactor);
 
 		return {
@@ -54,6 +63,10 @@ export const predictFillAtArrival = (input: PredictionInput, env: Env) =>
 		};
 	});
 
+/**
+ * Estimate when the P90 historical curve reaches 95% fill.
+ * Steps forward in 15-minute increments from currentHour to 10:00.
+ */
 export const estimateFullTime = (
 	currentFillPercent: number,
 	currentHour: number,
@@ -100,3 +113,59 @@ export const estimateFullTimeFromRate = (
 
 	return currentHour + minutesUntilFull / 60;
 };
+
+/**
+ * Get a stable leave-by time based purely on the P90 historical fill curve.
+ * Walks the P90 curve to find when it hits 95%, subtracts travel + buffer.
+ * Returns the leave-by time as decimal hours, or null if the lot isn't predicted to fill.
+ */
+export const getHistoricalLeaveByTime = (
+	station: string,
+	dayOfWeek: string,
+	travelMinutes: number,
+	buffer: number,
+	env: Env,
+) =>
+	Effect.gen(function* () {
+		const historical = yield* getHistoricalData(station, dayOfWeek, env);
+
+		// Walk the P90 curve from 5am to 10am in 15-min steps to find when it hits 95%
+		let fullTimeHour: number | null = null;
+		for (let testHour = 5; testHour <= 10; testHour += 0.25) {
+			const baseline = getBaselineForHour(historical, testHour, 'p90');
+			if (baseline >= 95) {
+				fullTimeHour = testHour;
+				break;
+			}
+		}
+
+		if (fullTimeHour === null) return null;
+
+		// Subtract buffer and travel time to get leave-by as decimal hours
+		const mustArriveBy = fullTimeHour - buffer / 60;
+		const leaveByDecimal = mustArriveBy - travelMinutes / 60;
+
+		return { leaveByDecimal, fullTimeHour, confidence: historical ? ('high' as const) : ('low' as const) };
+	});
+
+/**
+ * Get how far today's fill deviates from the P90 baseline at the current hour.
+ * Positive = today is worse than P90, negative = today is better.
+ */
+export const getDeviationFromBaseline = (
+	station: string,
+	dayOfWeek: string,
+	currentHour: number,
+	currentFillPercent: number,
+	env: Env,
+) =>
+	Effect.gen(function* () {
+		const historical = yield* getHistoricalData(station, dayOfWeek, env);
+		const baseline = getBaselineForHour(historical, currentHour, 'p90');
+
+		return {
+			deviation: currentFillPercent - baseline,
+			baseline,
+			hasHistoricalData: historical !== null,
+		};
+	});

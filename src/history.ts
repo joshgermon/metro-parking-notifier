@@ -6,6 +6,7 @@ const BucketData = Schema.Struct({
 	samples: Schema.Array(Schema.Number),
 	avg: Schema.Number,
 	count: Schema.Number,
+	p90: Schema.optionalWith(Schema.Number, { default: () => 0 }),
 });
 
 const DailyHistory = Schema.Record({ 
@@ -17,6 +18,16 @@ type DailyHistory = Schema.Schema.Type<typeof DailyHistory>;
 export type BucketData = Schema.Schema.Type<typeof BucketData>;
 export type HistoricalData = Record<string, BucketData>;
 
+const getPercentile = (samples: number[], percentile: number): number => {
+	if (samples.length === 0) return 0;
+	const sorted = [...samples].sort((a, b) => a - b);
+	const index = (percentile / 100) * (sorted.length - 1);
+	const lower = Math.floor(index);
+	const upper = Math.ceil(index);
+	if (lower === upper) return sorted[lower];
+	return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
+};
+
 export const recordBatchFillRates = (results: Record<string, number>, dayOfWeek: string, hour: number, env: Env) =>
 	Effect.gen(function* () {
 		const key = `history:v2:${dayOfWeek}`;
@@ -24,7 +35,7 @@ export const recordBatchFillRates = (results: Record<string, number>, dayOfWeek:
 
 		const existingRaw = yield* Effect.tryPromise(() => env.METRO_KV.get(key, 'json'));
 		
-		type MutableBucket = { samples: number[]; avg: number; count: number };
+		type MutableBucket = { samples: number[]; avg: number; count: number; p90: number };
 		type MutableDayHistory = Record<string, Record<string, MutableBucket>>;
 		
 		let dayData: MutableDayHistory = {};
@@ -42,11 +53,12 @@ export const recordBatchFillRates = (results: Record<string, number>, dayOfWeek:
 			}
 			
 			const stationHistory = dayData[stationName];
-			const bucket = stationHistory[hourKey] || { samples: [], avg: 0, count: 0 };
+			const bucket = stationHistory[hourKey] || { samples: [], avg: 0, count: 0, p90: 0 };
 
 			bucket.samples.push(percent);
 			bucket.count++;
 			bucket.avg = Math.round(bucket.samples.reduce((a, b) => a + b, 0) / bucket.count);
+			bucket.p90 = Math.round(getPercentile(bucket.samples, 90));
 
 			if (bucket.samples.length > 30) {
 				bucket.samples = bucket.samples.slice(-30);

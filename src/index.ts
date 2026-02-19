@@ -55,13 +55,15 @@ const compactUserDetail = (n: UserNotificationResult) =>
 			['trigger', n.trigger],
 			['dmCached', n.dmChannelCached],
 			['errorType', n.errorType],
+			['deviation', n.deviation !== undefined ? `${n.deviation > 0 ? '+' : ''}${Math.round(n.deviation)}pp` : undefined],
 		] as const).filter(([, v]) => v !== undefined && v !== null),
 	);
 
 const buildCronAnnotations = (
 	sydney: { timeString: string; dayOfWeek: string },
-	collection: CollectionResult,
+	collection: CollectionResult | null,
 	notifications: readonly UserNotificationResult[],
+	mode: string,
 ): Record<string, unknown> => {
 	const sent = notifications.filter(n => n.outcome === 'sent').length;
 	const skipped = notifications.filter(n => n.outcome === 'skipped').length;
@@ -70,11 +72,14 @@ const buildCronAnnotations = (
 	return {
 		time: sydney.timeString,
 		day: sydney.dayOfWeek,
-		changed: collection.changed,
-		stationsChecked: collection.stationsChecked,
-		stationsRecorded: collection.stationsRecorded,
-		zoneKeysRecorded: collection.zoneKeysRecorded,
-		...(collection.fetchErrors.length > 0 && { fetchErrors: collection.fetchErrors.join('; ') }),
+		mode,
+		...(collection && {
+			changed: collection.changed,
+			stationsChecked: collection.stationsChecked,
+			stationsRecorded: collection.stationsRecorded,
+			zoneKeysRecorded: collection.zoneKeysRecorded,
+			...(collection.fetchErrors.length > 0 && { fetchErrors: collection.fetchErrors.join('; ') }),
+		}),
 		users: notifications.length,
 		sent,
 		skipped,
@@ -89,9 +94,44 @@ const annotatedLog = (message: string, annotations: Record<string, unknown>) =>
 		Effect.log(message) as Effect.Effect<void>,
 	);
 
+const PEAK_START = 6;  // 6:00am — full processing starts
+const PEAK_END = 9;    // 9:00am — full processing ends
+const TRACK_START = 5; // 5:00am — data collection starts
+const TRACK_END = 10;  // 10:00am — data collection ends
+const OFF_PEAK_INTERVAL_MINUTES = 15; // Only collect data every 15 min outside peak
+
 const handleScheduled = (_controller: ScheduledController, env: Env) =>
 	Effect.gen(function* () {
 		const sydney = getSydneyTime();
+		const currentHour = sydney.hour + sydney.minute / 60;
+
+		// Safety check: skip entirely outside tracking window (5am-10am)
+		// The cron should already handle this, but belt-and-braces
+		if (currentHour < TRACK_START || currentHour >= TRACK_END) {
+			yield* annotatedLog('cron', { time: sydney.timeString, day: sydney.dayOfWeek, mode: 'outside_hours' });
+			return;
+		}
+
+		const isPeak = currentHour >= PEAK_START && currentHour < PEAK_END;
+
+		if (!isPeak) {
+			// Off-peak (5-6am, 9-10am): only collect data every ~15 minutes
+			if (sydney.minute % OFF_PEAK_INTERVAL_MINUTES >= 2) {
+				// Skip this run — not on a ~15-minute boundary (allow 2-min window for cron jitter)
+				yield* annotatedLog('cron', { time: sydney.timeString, day: sydney.dayOfWeek, mode: 'offpeak_skip' });
+				return;
+			}
+
+			// Collect data but don't process notifications
+			const collection = yield* collectHistoricalData(env);
+			yield* annotatedLog(
+				'cron',
+				buildCronAnnotations({ timeString: sydney.timeString, dayOfWeek: sydney.dayOfWeek }, collection, [], 'offpeak_collect'),
+			);
+			return;
+		}
+
+		// Peak hours (6-9am): full processing every 2 minutes
 		const collection = yield* collectHistoricalData(env);
 
 		const notifications = collection.changed
@@ -100,7 +140,7 @@ const handleScheduled = (_controller: ScheduledController, env: Env) =>
 
 		yield* annotatedLog(
 			'cron',
-			buildCronAnnotations({ timeString: sydney.timeString, dayOfWeek: sydney.dayOfWeek }, collection, notifications),
+			buildCronAnnotations({ timeString: sydney.timeString, dayOfWeek: sydney.dayOfWeek }, collection, notifications, 'peak'),
 		);
 	});
 
